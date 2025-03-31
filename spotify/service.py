@@ -60,6 +60,7 @@ class SpotifyService:
 
     async def refresh_access_token(self):
         """Refresh access token using refresh token"""
+        print("Refreshing access token")
         if not self.refresh_token:
             raise ValueError("No refresh token available")
 
@@ -89,6 +90,7 @@ class SpotifyService:
 
     async def get_now_playing(self):
         """Get currently playing track"""
+        print("Checking if access token is valid")
         if not self.access_token or time.time() > self.token_expires_at:
             await self.refresh_access_token()
 
