@@ -12,11 +12,16 @@ class ConnectionManager:
     def __init__(self):
         self.active_connections = []
         self.lock = asyncio.Lock()
+        self.polling_task = None
+        self.current_track_id = None
 
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
         async with self.lock:
             self.active_connections.append(websocket)
+            # Start polling if this is the first connection
+            if len(self.active_connections) == 1:
+                self.polling_task = asyncio.create_task(self._periodic_broadcast())
         print(f"New WebSocket connection. Total: {len(self.active_connections)}")
 
     async def disconnect(self, websocket: WebSocket):
@@ -25,6 +30,11 @@ class ConnectionManager:
                 self.active_connections.remove(websocket)
             except ValueError:
                 pass
+            # Stop polling if no connections remain
+            if len(self.active_connections) == 0 and self.polling_task:
+                self.polling_task.cancel()
+                self.polling_task = None
+                self.current_track_id = None
         print(f"WebSocket disconnected. Remaining: {len(self.active_connections)}")
 
     async def broadcast(self, message: str):
@@ -41,24 +51,26 @@ class ConnectionManager:
             for connection in dead_connections:
                 await self.disconnect(connection)
 
+    async def _periodic_broadcast(self):
+        """Periodically broadcast now-playing data only when there are active connections"""
+        while len(self.active_connections) > 0:
+            try:
+                data = await service.get_now_playing()
+                if data and "item" in data and "id" in data["item"]:
+                    track_id = data["item"]["id"]
+                    # Only broadcast if track changed
+                    if track_id != self.current_track_id:
+                        self.current_track_id = track_id
+                        await self.broadcast(json.dumps(data))
+                elif "error" in data:
+                    print(f"Spotify API error: {data['error']}")
+            except Exception as e:
+                print(f"Broadcast error: {e}")
+
+            await asyncio.sleep(5)  # Poll interval
+
 
 manager = ConnectionManager()
-
-
-async def periodic_broadcast():
-    """Periodically broadcast now-playing data to all clients"""
-    while True:
-        try:
-            data = await service.get_now_playing()
-            await manager.broadcast(json.dumps(data))
-        except Exception as e:
-            print(f"Broadcast error: {e}")
-        await asyncio.sleep(5)  # Update every 5 seconds
-
-
-@router.on_event("startup")
-async def startup_event():
-    asyncio.create_task(periodic_broadcast())
 
 
 @router.websocket("/ws/now-playing")
@@ -66,13 +78,12 @@ async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
     try:
         while True:
-            # Add ping/pong handling
+            # Keep connection alive with ping/pong
             try:
                 data = await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
                 if data == "ping":
                     await websocket.send_text("pong")
             except asyncio.TimeoutError:
-                # Send ping to client
                 await websocket.send_text("ping")
     except WebSocketDisconnect:
         await manager.disconnect(websocket)
@@ -104,10 +115,9 @@ async def callback(request: Request):
 
 @router.get("/now-playing")
 async def now_playing():
-    """Get current playing track and broadcast to WebSocket clients"""
+    """Get current playing track (one-time request)"""
     try:
         data = await service.get_now_playing()
-        await manager.broadcast(json.dumps(data))
         return data
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
